@@ -15,13 +15,15 @@
     <img src="https://godoc.org/github.com/chenjiandongx/mandodb?status.svg" alt="GoDoc">
  </a>
 
-时序数据库（TSDB: Time Series Database）大多数时候都是为了满足监控场景的需求，这里先介绍两个概念：
-* 数据点（Point）: 时序数据的数据点是一个包含 (Timestamp:int64, Value:float64) 的二元组。
+时序数据库（TSDB: Time Series Database）大多数时候都是为了满足监控场景的需求，这里先介绍**两个概念【重要】**：
+* 数据点（Point）: 时序数据的数据点是一个包含 (Timestamp:int64, Value:float64) 的二元组。我的理解是：一个时刻下的指标值
 * 时间线（Series）: 不同标签（Label）的组合称为不同的时间线，如 
 ```shell
 series1: {"__name__": "netspeed", "host": "localhost", "iface": "eth0"}
 series2: {"__name__": "netspeed", "host": "localhost", "iface": "eth1"}
 ```
+
+上述表示2个时间线。
 
 [Prometheus](https://prometheus.io/), [InfluxDB](https://www.influxdata.com/), [M3](https://m3db.io/), [TimescaleDB](https://www.timescale.com/) 都是时下流行的 TSDB。时序数据的压缩算法很大程度上决定了 TSDB 的性能，以上几个项目的实现都参考了 Facebook 2015 年发表的论文[《Gorilla: A fast, scalable, in-memory time series database》](http://www.vldb.org/pvldb/vol8/p1816-teller.pdf) 中提到的差值算法，该算法平均可以将 16 字节的数据点压缩成 1.37 字节，下文会介绍。
 
@@ -61,7 +63,7 @@ prometheus 的核心开发者 Fabian Reinartz 写了一篇文章 [《Writing a T
 ## 💡 数据模型 & API 文档
 
 **数据模型定义**
-```golang
+```go
 // Point 表示一个数据点 (ts, value) 二元组
 type Point struct {
 	Ts    int64 // in seconds
@@ -96,7 +98,7 @@ type LabelMatcherSet []LabelMatcher
 ```
 
 **API**
-```golang
+```go
 // InsertRows 写数据
 InsertRows(rows []*Row) error 
 
@@ -114,7 +116,7 @@ QueryLabelValues(label string, start, end int64) []string
 
 配置项在初始化 TSDB 的时候设置。
 
-```golang
+```go
 // WithMetaSerializerType 设置 Metadata 数据的序列化类型
 // 目前只提供了 BinaryMetaSerializer
 WithMetaSerializerType(t MetaSerializerType) Option 
@@ -157,7 +159,7 @@ WithLoggerConfig(opt *logger.Options) Option
 
 ## 🔖 用法示例
 
-```golang
+```go
 package main
 
 import (
@@ -566,8 +568,8 @@ mmap 内存映射的实现过程，总的来说可以分为三个阶段：
 | Sid（主键） | Label1 | Label2 | Label3 | Label4 | ... | LabelN |
 | ---- | ------ | ------ | ------ | ------ | --- | ------ |
 | sid1 | × | × | × |  | ... | × |
-| sid2 |  | × | × | × | ... | × |  
-| sid3 | × | × |  | × | ... | × |  
+| sid2 |  | × | × | × | ... | × |
+| sid3 | × | × |  | × | ... | × |
 | sid4 | × |  | × | × | ... | × |
 
 时序数据是 `NoSchema` 的，没办法提前建表和定义数据模型 🤔，因为我们要支持用户上报**任意 Label 组合**的数据，这样的话就没办法进行动态的扩展了。或许你会灵光一现 ✨，既然这样，那把 Labels 放一个字段拼接起来不就可以无限扩展啦，比如下面这个样子。
@@ -608,6 +610,43 @@ sid2; sid3; sid5
 两者求一个交集，就可以得到最终要查询的 Sid 为 `sid2` 和 `sid3`。🙂 Nice!
 
 假设我们的查询只支持**相等匹配**的话，格局明显就小了 🤌。查询条件是 `{vm=~"node*", iface="eth0"}` 肿么办？对 label1、label2、label3 和 label4 一起求一个并集吗？显然不是，因为这样算的话那结果就是 `sid3`。
+
+举例：**让我们通过代入具体的数值和例子，来通俗易懂地说明如何查询时使用并集和交集操作：**
+
+假设你有以下的标签和 `sid`（Series ID）映射关系：
+
+- `vm="node1"` 对应的 `sid` 是 `sid1, sid2, sid3`
+- `vm="node2"` 对应的 `sid` 是 `sid2, sid3, sid4`
+- `iface="eth0"` 对应的 `sid` 是 `sid3, sid5, sid6`
+- `iface="eth1"` 对应的 `sid` 是 `sid2, sid3, sid7`
+
+**查询条件： `{vm=~"node*", iface="eth0"}`**
+
+这个查询条件意味着：
+
+1. 查找所有 `vm` 标签值以 "node" 开头的时间线（即 `vm="node1"` 和 `vm="node2"`）。
+2. 查找所有 `iface="eth0"` 的时间线。
+
+**步骤 1: 匹配 `vm=~"node*"` 的标签**
+
+- 这个正则条件会匹配到 `vm="node1"` 和 `vm="node2"` 两个标签。
+- `vm="node1"` 对应的 `sid` 是：`sid1, sid2, sid3`
+- `vm="node2"` 对应的 `sid` 是：`sid2, sid3, sid4`
+
+并集操作：
+
+- 对 `vm="node1"` 和 `vm="node2"` 的 `sid` 进行并集操作：
+   `sid1, sid2, sid3, sid4` （这就是所有符合 `vm=~"node*"` 条件的 `sid`）
+
+**步骤 2: 匹配 `iface="eth0"` 的标签**
+
+- `iface="eth0"` 对应的 `sid` 是：`sid3, sid5, sid6`
+
+**步骤 3: 求交集**
+
+现在我们需要对步骤 1 得到的结果（`sid1, sid2, sid3, sid4`）和步骤 2 得到的结果（`sid3, sid5, sid6`）进行交集操作。
+
+- 求交集：`sid3`（这是唯一出现在两个集合中的 `sid`）
 
 厘清关系就不难看出，**只要对相同的 Label Name 做并集然后再对不同的 Label Name 求交集就可以了**。这样算的正确结果就是 `sid3` 和 `sid5`。实现的时候用到了 Roaring Bitmap，一种优化的位图算法。
 
@@ -983,6 +1022,8 @@ Series Block 记录了每条时间线的元数据，字段解释如下。
 
 <p align="center"><image src="./images/series-block.png" width="620px"></p>
 
+**※：时序数据库的架构图可以从Series Block从前看更加容易理解**
+
 了解完设计，再看看 Meta Block 编码和解编码的代码实现，binaryMetaSerializer 实现了 `MetaSerializer` 接口。
 
 ```golang
@@ -1160,6 +1201,14 @@ A: 😂 Writing this document.
 A: ***🍻 Life is magic. Coding is art. Bilibili!***
 
 ![bilibili](./images/bilibili.png)
+
+**时序数据库（TSDB）的好处可以概括为以下几点：**
+
+1. **高效存储**：针对大量按时间顺序排列的数据（如传感器数据、监控数据），TSDB 通过优化存储方式，如压缩、索引和降采样，减少了存储空间的需求。
+2. **快速查询**：TSDB 专门设计用来处理基于时间的查询，能够高效地检索某一时间段内的数据，避免了传统数据库在处理时序数据时的性能瓶颈。
+3. **高吞吐量**：TSDB 支持高频次的数据写入，特别适合实时数据流，保证数据快速存入并能实时查询。
+4. **灵活的时间范围查询**：TSDB 提供了强大的时间范围查询能力，能够快速查询任意时间段的数据，适合需要频繁回溯数据的场景。
+5. **压缩和降采样**：通过数据压缩和降采样技术，TSDB 能够高效地存储长时间范围内的大量数据，并且在查询时保持高性能。
 
 ## 📑 License
 
